@@ -1,0 +1,82 @@
+const { Client, GatewayIntentBits, Partials, WebhookClient, EmbedBuilder } = require("discord.js");
+const client = new Client({
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.GuildMembers,
+    GatewayIntentBits.MessageContent,
+  ],
+  partials: [Partials.Message, Partials.Channel, Partials.Reaction],
+});
+
+const TOKEN = "YOUR_BOT_TOKEN";
+const WEBHOOK_URL = "YOUR_WEBHOOK_URL"; // create one in your log channel
+const webhook = new WebhookClient({ url: WEBHOOK_URL });
+
+// toggle system
+let logConfig = {
+  messageDelete: true,
+  messageUpdate: true,
+  guildMemberAdd: true,
+  guildMemberRemove: true,
+};
+
+client.once("ready", () => {
+  console.log(`✅ Logged in as ${client.user.tag}`);
+});
+
+// message deleted
+client.on("messageDelete", async (msg) => {
+  if (!logConfig.messageDelete || msg.author?.bot) return;
+  const embed = new EmbedBuilder()
+    .setTitle("🗑️ Message Deleted")
+    .setDescription(`Message by **${msg.author.tag}** in <#${msg.channel.id}>`)
+    .addFields({ name: "Content", value: msg.content || "No content" })
+    .setColor("Red")
+    .setTimestamp();
+  webhook.send({ embeds: [embed] });
+});
+
+// message edited
+client.on("messageUpdate", async (oldMsg, newMsg) => {
+  if (!logConfig.messageUpdate || oldMsg.author?.bot) return;
+  if (oldMsg.content === newMsg.content) return;
+  const embed = new EmbedBuilder()
+    .setTitle("✏️ Message Edited")
+    .setDescription(`Message by **${oldMsg.author.tag}** in <#${oldMsg.channel.id}>`)
+    .addFields(
+      { name: "Before", value: oldMsg.content || "No content" },
+      { name: "After", value: newMsg.content || "No content" }
+    )
+    .setColor("Orange")
+    .setTimestamp();
+  webhook.send({ embeds: [embed] });
+});
+
+// member joins
+client.on("guildMemberAdd", (member) => {
+  if (!logConfig.guildMemberAdd) return;
+  const embed = new EmbedBuilder()
+    .setTitle("👋 Member Joined")
+    .setDescription(`${member.user.tag} joined the server.`)
+    .setThumbnail(member.user.displayAvatarURL())
+    .setColor("Green")
+    .setTimestamp();
+  webhook.send({ embeds: [embed] });
+});
+
+// member leaves
+client.on("guildMemberRemove", (member) => {
+  if (!logConfig.guildMemberRemove) return;
+  const embed = new EmbedBuilder()
+    .setTitle("👋 Member Left")
+    .setDescription(`${member.user.tag} left the server.`)
+    .setThumbnail(member.user.displayAvatarURL())
+    .setColor("Grey")
+    .setTimestamp();
+  webhook.send({ embeds: [embed] });
+});
+
+client.login(TOKEN);
+
+
