@@ -1,0 +1,35 @@
+const { Client, GatewayIntentBits } = require('discord.js');
+const TOKEN = 'YOUR_BOT_TOKEN'; // Replace with your bot token
+
+// List of swear words to filter
+const swearWords = ['badword1', 'badword2', 'badword3']; // Replace with actual words
+
+const client = new Client({
+    intents: [
+        GatewayIntentBits.Guilds,
+        GatewayIntentBits.GuildMessages,
+        GatewayIntentBits.MessageContent
+    ]
+});
+
+client.once('ready', () => {
+    console.log(`Logged in as ${client.user.tag}`);
+});
+
+client.on('messageCreate', async (message) => {
+    if (message.author.bot) return; // Ignore bot messages
+
+    // Check if the message contains a swear word
+    const containsSwear = swearWords.some(word =>
+        message.content.toLowerCase().includes(word.toLowerCase())
+    );
+
+    if (containsSwear) {
+        await message.delete(); // Delete the message
+        await message.channel.send(`${message.author}, watch your language!`);
+    }
+});
+
+client.login(TOKEN);
+
+
