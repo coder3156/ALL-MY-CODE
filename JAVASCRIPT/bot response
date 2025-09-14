@@ -1,0 +1,51 @@
+const { Client, GatewayIntentBits } = require('discord.js');
+const { Configuration, OpenAIApi } = require('openai');
+
+// Setup Discord bot
+const client = new Client({
+    intents: [
+        GatewayIntentBits.Guilds,
+        GatewayIntentBits.GuildMessages,
+        GatewayIntentBits.MessageContent
+    ]
+});
+
+// Replace with your keys
+const DISCORD_TOKEN = 'YOUR_DISCORD_BOT_TOKEN';
+const OPENAI_API_KEY = 'YOUR_OPENAI_API_KEY';
+
+// Setup OpenAI
+const configuration = new Configuration({
+    apiKey: OPENAI_API_KEY,
+});
+const openai = new OpenAIApi(configuration);
+
+client.once('ready', () => {
+    console.log(`Logged in as ${client.user.tag}!`);
+});
+
+client.on('messageCreate', async (message) => {
+    if (message.author.bot) return; // Ignore bots
+
+    try {
+        // Get AI response from OpenAI
+        const response = await openai.createCompletion({
+            model: "text-davinci-003", // or "gpt-3.5-turbo" for chat API
+            prompt: message.content,
+            max_tokens: 150,
+            temperature: 0.7,
+        });
+
+        const aiReply = response.data.choices[0].text.trim();
+        await message.channel.send(aiReply);
+
+    } catch (error) {
+        console.error('Error with OpenAI API:', error);
+        await message.channel.send("Sorry, I couldn't think of a response! 😅");
+    }
+});
+
+client.login(DISCORD_TOKEN);
+
+
+
