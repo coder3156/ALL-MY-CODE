@@ -1,0 +1,75 @@
+const { Client, GatewayIntentBits, Partials } = require("discord.js");
+
+const client = new Client({
+    intents: [
+        GatewayIntentBits.Guilds,
+        GatewayIntentBits.GuildMessages,
+        GatewayIntentBits.MessageContent,
+        GatewayIntentBits.GuildMembers
+    ],
+    partials: [Partials.Message, Partials.Channel, Partials.User]
+});
+
+const TOKEN = "YOUR_BOT_TOKEN"; // Replace with your bot token
+
+// Store AFK users { userId: { reason: string, since: Date } }
+const afkUsers = new Map();
+
+client.once("ready", () => {
+    console.log(`✅ Logged in as ${client.user.tag}`);
+});
+
+client.on("messageCreate", async (message) => {
+    if (message.author.bot) return;
+
+    const args = message.content.trim().split(/ +/);
+    const cmd = args.shift()?.toLowerCase();
+
+    // AFK command
+    if (cmd === "!afk") {
+        const reason = args.join(" ") || "AFK";
+        afkUsers.set(message.author.id, { reason, since: new Date() });
+        return message.reply(`${message.author} is now AFK: ${reason}`);
+    }
+
+    // Remove AFK when user speaks again
+    if (afkUsers.has(message.author.id)) {
+        afkUsers.delete(message.author.id);
+        return message.channel.send(`👋 Welcome back ${message.author}, AFK removed.`);
+    }
+
+    // Check if mentioned users are AFK
+    for (const mention of message.mentions.users.values()) {
+        if (afkUsers.has(mention.id)) {
+            const data = afkUsers.get(mention.id);
+            const reason = data.reason;
+            const since = data.since;
+            const elapsed = Math.floor((Date.now() - since.getTime()) / 1000);
+
+            let ago;
+            if (elapsed < 60) {
+                ago = `${elapsed} second${elapsed !== 1 ? "s" : ""} ago`;
+            } else if (elapsed < 3600) {
+                const minutes = Math.floor(elapsed / 60);
+                ago = `${minutes} minute${minutes !== 1 ? "s" : ""} ago`;
+            } else {
+                const hours = Math.floor(elapsed / 3600);
+                ago = `${hours} hour${hours !== 1 ? "s" : ""} ago`;
+            }
+
+            const currentTime = new Date().toLocaleTimeString("en-US", {
+                hour: "2-digit",
+                minute: "2-digit",
+                hour12: true
+            });
+
+            message.channel.send(
+                `${mention} is AFK: ${reason} – ${ago}\nCurrent time: **${currentTime}**`
+            );
+        }
+    }
+});
+
+client.login(TOKEN);
+
+
