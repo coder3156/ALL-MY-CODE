@@ -1,0 +1,9 @@
+@bot.command()
+async def cat(ctx):
+    pics = [
+        "https://cataas.com/cat",
+        "https://placekitten.com/400/400"
+    ]
+    await ctx.send(random.choice(pics))
+
+
