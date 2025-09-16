@@ -1,0 +1,5 @@
+@bot.command()
+async def coffee(ctx):
+    await ctx.send("☕ Here’s a hot coffee for you!")
+
+
