@@ -1,0 +1,13 @@
+@bot.command()
+async def compliment(ctx, member: discord.Member = None):
+    compliments = [
+        "You're awesome! 🌟",
+        "You light up the server! ✨",
+        "Your energy is contagious. 💖"
+    ]
+    if not member:
+        await ctx.send("You need to mention someone to compliment! 💐")
+    else:
+        await ctx.send(f"{member.display_name}, {random.choice(compliments)}")
+
+
