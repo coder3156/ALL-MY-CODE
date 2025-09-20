@@ -1,0 +1,223 @@
+# bot.py
+# Discord.py (2.x) Community Quest Bot (async, single-file)
+import discord
+from discord.ext import commands, tasks
+import aiosqlite
+import asyncio
+import random
+import os
+from datetime import datetime, timezone
+
+TOKEN = os.getenv('DISCORD_TOKEN') or 'YOUR_BOT_TOKEN_HERE'
+PREFIX = '!'
+
+intents = discord.Intents.default()
+intents.message_content = False  # not necessary, we use commands
+intents.guilds = True
+intents.members = True
+
+bot = commands.Bot(command_prefix=PREFIX, intents=intents, help_command=commands.DefaultHelpCommand(no_category='Commands'))
+
+DB_PATH = 'questbot_py.db'
+XP_PER_QUEST = 50
+COINS_PER_QUEST = 30
+
+async def init_db():
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS users (
+                user_id TEXT PRIMARY KEY,
+                xp INTEGER DEFAULT 0,
+                coins INTEGER DEFAULT 0,
+                level INTEGER DEFAULT 1,
+                current_quest TEXT,
+                quest_assigned_at INTEGER
+            )
+        ''')
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS shop (
+                item_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT,
+                price INTEGER,
+                description TEXT
+            )
+        ''')
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS boss (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                name TEXT,
+                hp INTEGER,
+                max_hp INTEGER,
+                last_spawned INTEGER
+            )
+        ''')
+        await db.commit()
+
+        # ensure shop items
+        async with db.execute('SELECT COUNT(*) FROM shop') as cur:
+            row = await cur.fetchone()
+            count = row[0]
+        if count == 0:
+            items = [
+                ('Novice Hat', 50, 'A shiny hat for bragging rights.'),
+                ('XP Potion', 150, 'Gives you bonus XP on next quest.'),
+                ('Boss Hammer', 500, 'Deal more damage to the server boss next fight.')
+            ]
+            await db.executemany('INSERT INTO shop (name,price,description) VALUES (?,?,?)', items)
+            await db.commit()
+
+        # boss
+        async with db.execute('SELECT * FROM boss WHERE id=1') as cur:
+            row = await cur.fetchone()
+        if not row:
+            await db.execute('INSERT INTO boss (id,name,hp,max_hp,last_spawned) VALUES (1,?,?,?,?,)'.replace('?,?,?,?,', ''),)  # fallback - better to do explicit
+            # simpler: insert with values
+            await db.execute('INSERT OR REPLACE INTO boss (id, name, hp, max_hp, last_spawned) VALUES (1, ?, ?, ?, ?)',
+                             ('Ancient Hydra', 2000, 2000, int(datetime.now(timezone.utc).timestamp())))
+            await db.commit()
+
+async def ensure_user(user_id):
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute('SELECT * FROM users WHERE user_id = ?', (user_id,)) as cur:
+            row = await cur.fetchone()
+        if not row:
+            await db.execute('INSERT INTO users (user_id, xp, coins, level) VALUES (?,0,0,1)', (user_id,))
+            await db.commit()
+
+def get_random_quest():
+    pool = [
+        'Send 3 positive messages today',
+        'Invite someone to voice chat',
+        'Share a meme in #memes',
+        'React to 5 different messages',
+        'Post a helpful tip in #help',
+        'Post an artwork or screenshot'
+    ]
+    return random.choice(pool)
+
+def level_up_check(xp, level):
+    need = 100 + (level - 1) * 50
+    return xp >= need
+
+@bot.event
+async def on_ready():
+    print(f'Logged in as {bot.user}')
+    # Ensure DB exists
+    await init_db()
+
+@bot.command()
+async def quest(ctx):
+    uid = str(ctx.author.id)
+    await ensure_user(uid)
+    now = int(datetime.now(timezone.utc).timestamp())
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute('SELECT current_quest, quest_assigned_at FROM users WHERE user_id = ?', (uid,)) as cur:
+            row = await cur.fetchone()
+        if row and row[0] and row[1] and (now - row[1]) < 24*3600:
+            await ctx.reply(f'Your current quest: **{row[0]}**', mention_author=False)
+            return
+        quest_text = get_random_quest()
+        await db.execute('UPDATE users SET current_quest = ?, quest_assigned_at = ? WHERE user_id = ?', (quest_text, now, uid))
+        await db.commit()
+        await ctx.reply(f'New quest: **{quest_text}** — when you complete it run `!complete`', mention_author=False)
+
+@bot.command()
+async def complete(ctx):
+    uid = str(ctx.author.id)
+    await ensure_user(uid)
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute('SELECT current_quest, xp, coins, level FROM users WHERE user_id = ?', (uid,)) as cur:
+            row = await cur.fetchone()
+        if not row or not row[0]:
+            await ctx.reply("You don't have an active quest. Run `!quest` to get one.", mention_author=False)
+            return
+        new_xp = row[1] + XP_PER_QUEST
+        new_coins = row[2] + COINS_PER_QUEST
+        new_level = row[3]
+        if level_up_check(new_xp, row[3]):
+            new_level += 1
+        await db.execute('UPDATE users SET xp=?, coins=?, level=?, current_quest=NULL, quest_assigned_at=NULL WHERE user_id=?',
+                         (new_xp, new_coins, new_level, uid))
+        await db.commit()
+        await ctx.reply(f'Quest complete! +{XP_PER_QUEST} XP, +{COINS_PER_QUEST} coins. You are now level {new_level}.', mention_author=False)
+
+@bot.command()
+async def profile(ctx, member: discord.Member = None):
+    target = member or ctx.author
+    uid = str(target.id)
+    await ensure_user(uid)
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute('SELECT xp, coins, level, current_quest FROM users WHERE user_id = ?', (uid,)) as cur:
+            row = await cur.fetchone()
+    await ctx.reply(f'**{target.display_name}**\nLevel: {row[2]}\nXP: {row[0]}\nCoins: {row[1]}\nCurrent quest: {row[3] or "None"}', mention_author=False)
+
+@bot.command()
+async def shop(ctx):
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute('SELECT item_id, name, price, description FROM shop') as cur:
+            rows = await cur.fetchall()
+    lines = [f'ID {r[0]} — **{r[1]}** — {r[2]} coins — {r[3]}' for r in rows]
+    await ctx.reply('**Shop**\n' + '\n'.join(lines), mention_author=False)
+
+@bot.command()
+async def buy(ctx, item_id: int):
+    uid = str(ctx.author.id)
+    await ensure_user(uid)
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute('SELECT name, price FROM shop WHERE item_id = ?', (item_id,)) as cur:
+            item = await cur.fetchone()
+        if not item:
+            await ctx.reply('Item not found. Use `!shop` to see items.', mention_author=False)
+            return
+        async with db.execute('SELECT coins FROM users WHERE user_id = ?', (uid,)) as cur:
+            user = await cur.fetchone()
+        if user[0] < item[1]:
+            await ctx.reply(f'Not enough coins. You have {user[0]} coins.', mention_author=False)
+            return
+        await db.execute('UPDATE users SET coins = coins - ? WHERE user_id = ?', (item[1], uid))
+        await db.commit()
+        await ctx.reply(f'You bought **{item[0]}** for {item[1]} coins!', mention_author=False)
+
+@bot.command()
+async def leaderboard(ctx):
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute('SELECT user_id, xp, coins, level FROM users ORDER BY xp DESC LIMIT 10') as cur:
+            rows = await cur.fetchall()
+    lines = []
+    for i, r in enumerate(rows, start=1):
+        lines.append(f'{i}. <@{r[0]}> — Level {r[3]} — XP {r[1]} — {r[2]} coins')
+    await ctx.reply('**Leaderboard**\n' + '\n'.join(lines), mention_author=False)
+
+@bot.command()
+async def attack(ctx, power: int = 10):
+    power = max(1, min(100, power))
+    uid = str(ctx.author.id)
+    await ensure_user(uid)
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute('SELECT name, hp, max_hp FROM boss WHERE id = 1') as cur:
+            b = await cur.fetchone()
+        if not b:
+            await ctx.reply('No boss right now.', mention_author=False)
+            return
+        damage = random.randint(power, power + int(power/2))
+        if random.random() < 0.1:
+            damage *= 2
+        new_hp = max(0, b[1] - damage)
+        await db.execute('UPDATE boss SET hp = ? WHERE id = 1', (new_hp,))
+        # reward player
+        await db.execute('UPDATE users SET xp = xp + ?, coins = coins + ? WHERE user_id = ?', (damage//5, damage//10, uid))
+        await db.commit()
+    msg = f'<@{uid}> attacked **{b[0]}** for **{damage}** damage! Boss HP: {new_hp}/{b[2]}\n(You gained {damage//5} XP and {damage//10} coins)'
+    if new_hp == 0:
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute('UPDATE users SET coins = coins + 50')  # reward everyone
+            await db.execute('UPDATE boss SET hp = max_hp, last_spawned = ? WHERE id = 1', (int(datetime.now(timezone.utc).timestamp()),))
+            await db.commit()
+        msg += '\n**The boss was defeated!** Everyone got +50 coins. The boss has respawned.'
+    await ctx.reply(msg, mention_author=False)
+
+# Run
+if __name__ == '__main__':
+    bot.run(TOKEN)
+
+
