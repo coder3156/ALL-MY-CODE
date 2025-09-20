@@ -1,0 +1,297 @@
+// bot.js
+// Node.js 18+, discord.js v14+, sqlite3
+import fs from "fs";
+import sqlite3 from "sqlite3";
+import { open } from "sqlite";
+import {
+  Client,
+  GatewayIntentBits,
+  PermissionsBitField,
+  REST,
+  Routes,
+  EmbedBuilder,
+} from "discord.js";
+
+const config = JSON.parse(fs.readFileSync("./config.json", "utf-8"));
+const TOKEN = config.token;
+const OWNERS = config.owners || [];
+
+// ---------- Client ----------
+const client = new Client({
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMembers,
+    GatewayIntentBits.GuildBans,
+  ],
+});
+
+// ---------- Database ----------
+const db = await open({
+  filename: config.database || "departments.db",
+  driver: sqlite3.Database,
+});
+
+await db.exec(`
+CREATE TABLE IF NOT EXISTS departments (
+  name TEXT NOT NULL,
+  guild_id INTEGER NOT NULL,
+  UNIQUE(name, guild_id)
+);
+`);
+
+await db.exec(`
+CREATE TABLE IF NOT EXISTS punishments (
+  case_id INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id INTEGER NOT NULL,
+  punishment_type TEXT NOT NULL,
+  reason TEXT,
+  staff_id INTEGER NOT NULL,
+  guild_id INTEGER NOT NULL,
+  timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+`);
+
+// ---------- Helpers ----------
+async function getDepartmentName(guildId) {
+  const row = await db.get("SELECT name FROM departments WHERE guild_id = ?", guildId);
+  return row ? row.name : null;
+}
+
+async function getGuildsInDepartment(deptName) {
+  const rows = await db.all("SELECT guild_id FROM departments WHERE name = ?", deptName);
+  return rows.map(r => r.guild_id);
+}
+
+async function getLinkedGuilds(guildId) {
+  const dept = await getDepartmentName(guildId);
+  if (!dept) return [];
+  return getGuildsInDepartment(dept);
+}
+
+async function insertPunishment(userId, type, reason, staffId, guildId) {
+  const result = await db.run(
+    "INSERT INTO punishments (user_id, punishment_type, reason, staff_id, guild_id) VALUES (?, ?, ?, ?, ?)",
+    userId, type, reason, staffId, guildId
+  );
+  return result.lastID;
+}
+
+// ---------- Slash Commands ----------
+const commands = [
+  {
+    name: "adddepartment",
+    description: "Add this server to a department",
+    options: [
+      { name: "name", type: 3, description: "Department name", required: true },
+    ],
+  },
+  {
+    name: "removedepartment",
+    description: "Remove this server from its department",
+  },
+  {
+    name: "department_info",
+    description: "Show department name and linked servers",
+  },
+  {
+    name: "warn",
+    description: "Warn a user across this department",
+    options: [
+      { name: "user", type: 6, description: "User to warn", required: true },
+      { name: "reason", type: 3, description: "Reason", required: false },
+    ],
+  },
+  {
+    name: "synckick",
+    description: "Kick a user across this department",
+    options: [
+      { name: "user", type: 6, description: "User to kick", required: true },
+      { name: "reason", type: 3, description: "Reason", required: false },
+    ],
+  },
+  {
+    name: "syncmute",
+    description: "Timeout a user across this department",
+    options: [
+      { name: "user", type: 6, description: "User to mute", required: true },
+      { name: "minutes", type: 4, description: "Duration in minutes", required: true },
+      { name: "reason", type: 3, description: "Reason", required: false },
+    ],
+  },
+  {
+    name: "syncban",
+    description: "Ban a user across this department",
+    options: [
+      { name: "user", type: 6, description: "User to ban", required: true },
+      { name: "reason", type: 3, description: "Reason", required: false },
+    ],
+  },
+  {
+    name: "punishments",
+    description: "View punishments for a user",
+    options: [
+      { name: "user", type: 6, description: "User to view", required: true },
+    ],
+  },
+  {
+    name: "case",
+    description: "Lookup a single punishment by Case ID",
+    options: [
+      { name: "case_id", type: 4, description: "Case ID", required: true },
+    ],
+  },
+];
+
+const rest = new REST({ version: "10" }).setToken(TOKEN);
+
+client.once("ready", async () => {
+  console.log(`Logged in as ${client.user.tag}`);
+
+  try {
+    await rest.put(Routes.applicationCommands(client.user.id), { body: commands });
+    console.log("Slash commands registered.");
+  } catch (err) {
+    console.error(err);
+  }
+});
+
+// ---------- Command Handling ----------
+client.on("interactionCreate", async (interaction) => {
+  if (!interaction.isChatInputCommand()) return;
+
+  const { commandName } = interaction;
+
+  // ---------------- Departments ----------------
+  if (commandName === "adddepartment") {
+    const name = interaction.options.getString("name");
+    await db.run("INSERT OR IGNORE INTO departments (name, guild_id) VALUES (?, ?)", name, interaction.guildId);
+    return interaction.reply({ content: `✅ Added this server to department **${name}**.`, ephemeral: true });
+  }
+
+  if (commandName === "removedepartment") {
+    await db.run("DELETE FROM departments WHERE guild_id = ?", interaction.guildId);
+    return interaction.reply({ content: "🗑️ Removed this server from its department.", ephemeral: true });
+  }
+
+  if (commandName === "department_info") {
+    const dept = await getDepartmentName(interaction.guildId);
+    if (!dept) return interaction.reply({ content: "ℹ️ This server is not in any department.", ephemeral: true });
+
+    const linkedGuilds = await getGuildsInDepartment(dept);
+    const names = linkedGuilds.map(gid => {
+      const g = client.guilds.cache.get(gid);
+      return g ? `${g.name} (\`${gid}\`)` : `\`${gid}\``;
+    });
+
+    return interaction.reply({ content: `**Department:** ${dept}\n**Linked Servers (${linkedGuilds.length}):**\n${names.join("\n")}`, ephemeral: true });
+  }
+
+  // ---------------- Punishments ----------------
+  const user = interaction.options.getUser("user");
+  const reason = interaction.options.getString("reason") || "No reason provided";
+  const minutes = interaction.options.getInteger("minutes");
+  const caseId = interaction.options.getInteger("case_id");
+  const linkedGuilds = await getLinkedGuilds(interaction.guildId);
+
+  if (commandName === "warn") {
+    const cases = [];
+    for (const gid of linkedGuilds) {
+      cases.push(await insertPunishment(user.id, "warn", reason, interaction.user.id, gid));
+    }
+    return interaction.reply({ content: `⚠️ Warned **${user.tag}** across ${linkedGuilds.length} servers. Cases: ${cases.join(", ")}`, ephemeral: true });
+  }
+
+  if (commandName === "synckick") {
+    const cases = [];
+    for (const gid of linkedGuilds) {
+      const g = client.guilds.cache.get(gid);
+      if (!g) continue;
+      const member = g.members.cache.get(user.id);
+      if (!member) continue;
+      try {
+        await member.kick(`[Dept Sync] ${reason}`);
+        cases.push(await insertPunishment(user.id, "kick", reason, interaction.user.id, gid));
+      } catch (err) {
+        console.warn(`Failed to kick in ${g.name}: ${err}`);
+      }
+    }
+    return interaction.reply({ content: `👢 Attempted kicks for **${user.tag}** across ${linkedGuilds.length} servers. Cases: ${cases.join(", ") || "—"}`, ephemeral: true });
+  }
+
+  if (commandName === "syncmute") {
+    const durationMs = minutes * 60 * 1000;
+    const cases = [];
+    for (const gid of linkedGuilds) {
+      const g = client.guilds.cache.get(gid);
+      if (!g) continue;
+      const member = g.members.cache.get(user.id);
+      if (!member) continue;
+      try {
+        await member.timeout(durationMs, `[Dept Sync] ${reason}`);
+        cases.push(await insertPunishment(user.id, "mute", reason, interaction.user.id, gid));
+      } catch (err) {
+        console.warn(`Failed to mute in ${g.name}: ${err}`);
+      }
+    }
+    return interaction.reply({ content: `🔇 Timed out **${user.tag}** for **${minutes}m** across ${linkedGuilds.length} servers. Cases: ${cases.join(", ") || "—"}`, ephemeral: true });
+  }
+
+  if (commandName === "syncban") {
+    const cases = [];
+    for (const gid of linkedGuilds) {
+      const g = client.guilds.cache.get(gid);
+      if (!g) continue;
+      try {
+        await g.members.ban(user.id, { reason: `[Dept Sync] ${reason}` });
+        cases.push(await insertPunishment(user.id, "ban", reason, interaction.user.id, gid));
+      } catch (err) {
+        console.warn(`Failed to ban in ${g.name}: ${err}`);
+      }
+    }
+    return interaction.reply({ content: `⛔ Banned **${user.tag}** across ${linkedGuilds.length} servers. Cases: ${cases.join(", ") || "—"}`, ephemeral: true });
+  }
+
+  if (commandName === "punishments") {
+    const rows = await db.all(
+      "SELECT case_id, punishment_type, reason, staff_id, guild_id, timestamp FROM punishments WHERE user_id = ? ORDER BY case_id DESC LIMIT 20",
+      user.id
+    );
+    if (!rows.length) return interaction.reply({ content: `No punishments found for **${user.tag}**.`, ephemeral: true });
+
+    const embed = new EmbedBuilder()
+      .setTitle(`Punishment History — ${user.tag}`)
+      .setColor("Red");
+
+    for (const r of rows) {
+      const g = client.guilds.cache.get(r.guild_id);
+      embed.addFields({
+        name: `Case #${r.case_id} • ${r.punishment_type.toUpperCase()} • ${g ? g.name : `\`${r.guild_id}\``}`,
+        value: `**Reason:** ${r.reason}\n**Staff ID:** ${r.staff_id}\n**Time:** ${r.timestamp}`,
+      });
+    }
+    return interaction.reply({ embeds: [embed], ephemeral: true });
+  }
+
+  if (commandName === "case") {
+    const row = await db.get("SELECT * FROM punishments WHERE case_id = ?", caseId);
+    if (!row) return interaction.reply({ content: `No punishment found with Case ID \`${caseId}\`.`, ephemeral: true });
+
+    const g = client.guilds.cache.get(row.guild_id);
+    const embed = new EmbedBuilder()
+      .setTitle(`Case #${row.case_id}`)
+      .addFields(
+        { name: "User ID", value: `${row.user_id}`, inline: true },
+        { name: "Type", value: row.punishment_type.toUpperCase(), inline: true },
+        { name: "Reason", value: row.reason || "No reason" },
+        { name: "Staff ID", value: `${row.staff_id}`, inline: true },
+        { name: "Server", value: g ? g.name : `${row.guild_id}`, inline: true },
+        { name: "Time", value: row.timestamp }
+      );
+    return interaction.reply({ embeds: [embed], ephemeral: true });
+  }
+});
+
+// ---------- Run ----------
+client.login(TOKEN);
+
+
