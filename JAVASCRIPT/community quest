@@ -1,0 +1,235 @@
+// index.js
+// Discord.js v14 Community Quest Bot (simple, single-file)
+const { Client, GatewayIntentBits, REST, Routes, SlashCommandBuilder, Collection } = require('discord.js');
+const Database = require('better-sqlite3');
+const path = require('path');
+
+const TOKEN = 'YOUR_BOT_TOKEN_HERE';
+const CLIENT_ID = 'YOUR_APPLICATION_ID';
+const GUILD_ID = 'OPTIONAL_GUILD_ID_FOR_COMMAND_REGISTRATION'; // use for development; leave blank to register global
+
+// Setup DB
+const db = new Database(path.join(__dirname, 'questbot.db'));
+db.prepare(`
+CREATE TABLE IF NOT EXISTS users (
+  user_id TEXT PRIMARY KEY,
+  xp INTEGER DEFAULT 0,
+  coins INTEGER DEFAULT 0,
+  level INTEGER DEFAULT 1,
+  current_quest TEXT,
+  quest_assigned_at INTEGER
+);
+`).run();
+
+db.prepare(`
+CREATE TABLE IF NOT EXISTS shop (
+  item_id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT,
+  price INTEGER,
+  description TEXT
+);`).run();
+
+db.prepare(`
+CREATE TABLE IF NOT EXISTS boss (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  name TEXT,
+  hp INTEGER,
+  max_hp INTEGER,
+  last_spawned INTEGER
+);
+`).run();
+
+// Ensure some shop items exist
+const insertItem = db.prepare('INSERT INTO shop (name,price,description) VALUES (@name,@price,@description)');
+const countItems = db.prepare('SELECT COUNT(*) AS c FROM shop').get().c;
+if (countItems === 0) {
+  const items = [
+    { name: 'Novice Hat', price: 50, description: 'A shiny hat for bragging rights.' },
+    { name: 'XP Potion', price: 150, description: 'Gives you bonus XP on next quest (not implemented).' },
+    { name: 'Boss Hammer', price: 500, description: 'Deal more damage to the server boss next fight.' }
+  ];
+  const insert = db.transaction((arr) => arr.forEach(i => insertItem.run(i)));
+  insert(items);
+}
+
+// Boss default
+const bossRow = db.prepare('SELECT * FROM boss WHERE id = 1').get();
+if (!bossRow) {
+  db.prepare('INSERT INTO boss (id, name, hp, max_hp, last_spawned) VALUES (1, "Ancient Hydra", 2000, 2000, strftime("%s","now"))').run();
+}
+
+// Utils
+const getRandomQuest = () => {
+  const pool = [
+    'Send 3 positive messages today',
+    'Invite someone to voice chat',
+    'Share a meme in #memes',
+    'React to 5 different messages',
+    'Post a helpful tip in #help',
+    'Post an artwork or screenshot'
+  ];
+  return pool[Math.floor(Math.random() * pool.length)];
+};
+
+const XP_PER_QUEST = 50;
+const COINS_PER_QUEST = 30;
+const LEVEL_UP = (xp, level) => {
+  // simple: next level requirement grows linearly
+  const need = 100 + (level - 1) * 50;
+  return xp >= need;
+};
+
+// Discord client
+const client = new Client({
+  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers, GatewayIntentBits.GuildMessages]
+});
+
+// Register slash commands (development helper)
+async function registerCommands() {
+  const commands = [
+    new SlashCommandBuilder().setName('quest').setDescription('Get your daily quest'),
+    new SlashCommandBuilder().setName('complete').setDescription('Complete your current quest'),
+    new SlashCommandBuilder().setName('profile').setDescription('Show your profile'),
+    new SlashCommandBuilder().setName('shop').setDescription('Show shop items'),
+    new SlashCommandBuilder().setName('buy').setDescription('Buy an item').addIntegerOption(opt => opt.setName('item').setDescription('Item id').setRequired(true)),
+    new SlashCommandBuilder().setName('leaderboard').setDescription('Show top players'),
+    new SlashCommandBuilder().setName('attack').setDescription('Attack the server boss').addIntegerOption(opt => opt.setName('power').setDescription('How hard you hit (1-100)').setRequired(false))
+  ].map(c => c.toJSON());
+
+  const rest = new REST({ version: '10' }).setToken(TOKEN);
+  if (GUILD_ID && GUILD_ID !== '') {
+    await rest.put(Routes.applicationGuildCommands(CLIENT_ID, GUILD_ID), { body: commands });
+    console.log('Registered guild commands.');
+  } else {
+    await rest.put(Routes.applicationCommands(CLIENT_ID), { body: commands });
+    console.log('Registered global commands.');
+  }
+}
+
+// DB helpers
+const ensureUser = (userId) => {
+  const stmt = db.prepare('SELECT * FROM users WHERE user_id = ?');
+  let u = stmt.get(userId);
+  if (!u) {
+    db.prepare('INSERT INTO users (user_id, xp, coins, level) VALUES (?,0,0,1)').run(userId);
+    u = stmt.get(userId);
+  }
+  return u;
+};
+
+// Handlers
+client.on('interactionCreate', async (interaction) => {
+  if (!interaction.isChatInputCommand()) return;
+  const { commandName } = interaction;
+  const userId = interaction.user.id;
+  ensureUser(userId);
+
+  if (commandName === 'quest') {
+    const user = db.prepare('SELECT * FROM users WHERE user_id = ?').get(userId);
+    const now = Math.floor(Date.now() / 1000);
+    // if user has quest and assigned within 24h, show same
+    if (user.current_quest && user.quest_assigned_at && (now - user.quest_assigned_at) < 24*3600) {
+      await interaction.reply({ content: `Your current quest: **${user.current_quest}**`, ephemeral: true });
+      return;
+    }
+    const quest = getRandomQuest();
+    db.prepare('UPDATE users SET current_quest = ?, quest_assigned_at = ? WHERE user_id = ?').run(quest, now, userId);
+    await interaction.reply({ content: `New Quest: **${quest}**\nComplete it and run /complete to claim rewards!`, ephemeral: true });
+  }
+
+  else if (commandName === 'complete') {
+    const user = db.prepare('SELECT * FROM users WHERE user_id = ?').get(userId);
+    if (!user.current_quest) {
+      await interaction.reply({ content: `You don't have an active quest. Run /quest to get one.`, ephemeral: true });
+      return;
+    }
+    // reward
+    const newXp = user.xp + XP_PER_QUEST;
+    const newCoins = user.coins + COINS_PER_QUEST;
+    let newLevel = user.level;
+    if (LEVEL_UP(newXp, user.level)) {
+      newLevel = user.level + 1;
+    }
+    db.prepare('UPDATE users SET xp = ?, coins = ?, level = ?, current_quest = NULL, quest_assigned_at = NULL WHERE user_id = ?')
+      .run(newXp, newCoins, newLevel, userId);
+    await interaction.reply({ content: `Quest complete! +${XP_PER_QUEST} XP, +${COINS_PER_QUEST} coins. You are now level ${newLevel}.`, ephemeral: false });
+  }
+
+  else if (commandName === 'profile') {
+    const user = db.prepare('SELECT * FROM users WHERE user_id = ?').get(userId);
+    await interaction.reply({
+      content: `**${interaction.user.username}**\nLevel: ${user.level}\nXP: ${user.xp}\nCoins: ${user.coins}\nCurrent quest: ${user.current_quest || 'None'}`,
+      ephemeral: false
+    });
+  }
+
+  else if (commandName === 'shop') {
+    const items = db.prepare('SELECT item_id, name, price, description FROM shop').all();
+    const lines = items.map(it => `ID ${it.item_id} — **${it.name}** — ${it.price} coins — ${it.description}`);
+    await interaction.reply({ content: `**Shop**\n` + lines.join('\n'), ephemeral: false });
+  }
+
+  else if (commandName === 'buy') {
+    const itemId = interaction.options.getInteger('item', true);
+    const item = db.prepare('SELECT * FROM shop WHERE item_id = ?').get(itemId);
+    if (!item) {
+      await interaction.reply({ content: `Item ${itemId} not found. Use /shop to see items.`, ephemeral: true });
+      return;
+    }
+    const user = db.prepare('SELECT * FROM users WHERE user_id = ?').get(userId);
+    if (user.coins < item.price) {
+      await interaction.reply({ content: `Not enough coins. You have ${user.coins} coins.`, ephemeral: true });
+      return;
+    }
+    db.prepare('UPDATE users SET coins = coins - ? WHERE user_id = ?').run(item.price, userId);
+    await interaction.reply({ content: `You bought **${item.name}** for ${item.price} coins!`, ephemeral: false });
+  }
+
+  else if (commandName === 'leaderboard') {
+    const top = db.prepare('SELECT user_id, xp, coins, level FROM users ORDER BY xp DESC LIMIT 10').all();
+    const lines = top.map((r, i) => `${i+1}. <@${r.user_id}> — Level ${r.level} — XP ${r.xp} — ${r.coins} coins`);
+    await interaction.reply({ content: `**Leaderboard**\n${lines.join('\n')}`, ephemeral: false });
+  }
+
+  else if (commandName === 'attack') {
+    const power = Math.max(1, Math.min(100, interaction.options.getInteger('power') || 10));
+    const boss = db.prepare('SELECT * FROM boss WHERE id = 1').get();
+    if (!boss) {
+      await interaction.reply({ content: 'No boss exists right now.', ephemeral: true });
+      return;
+    }
+    // compute damage
+    let damage = Math.floor(power + Math.random()*power);
+    // check if user has "Boss Hammer" (not implemented as ownership table). keep simple: 10% chance to crit
+    if (Math.random() < 0.1) damage *= 2;
+    const newHP = Math.max(0, boss.hp - damage);
+    db.prepare('UPDATE boss SET hp = ? WHERE id = 1').run(newHP);
+    // reward coins and xp to user
+    db.prepare('UPDATE users SET xp = xp + ?, coins = coins + ? WHERE user_id = ?').run(Math.floor(damage/5), Math.floor(damage/10), userId);
+
+    let msg = `<@${userId}> attacked **${boss.name}** for **${damage}** damage! Boss HP: ${newHP}/${boss.max_hp}\n(You gained ${Math.floor(damage/5)} XP and ${Math.floor(damage/10)} coins)`;
+    if (newHP === 0) {
+      // reward everyone briefly: grant 100 coins to top 10 participants? simple: reward everyone in users table small coins
+      db.prepare('UPDATE users SET coins = coins + 50').run();
+      // reset boss
+      db.prepare('UPDATE boss SET hp = max_hp, last_spawned = strftime("%s","now") WHERE id = 1').run();
+      msg += `\n**The boss was defeated!** Everyone got +50 coins. The boss has respawned.`;
+    }
+    await interaction.reply({ content: msg, ephemeral: false });
+  }
+});
+
+client.once('ready', async () => {
+  console.log(`Logged in as ${client.user.tag}`);
+});
+
+(async () => {
+  try {
+    await registerCommands();
+    await client.login(TOKEN);
+  } catch (err) {
+    console.error(err);
+  }
+})();
+
+
