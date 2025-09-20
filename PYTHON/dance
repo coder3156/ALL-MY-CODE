@@ -1,0 +1,6 @@
+@bot.command()
+async def dance(ctx):
+    dances = ["💃", "🕺", "🎶"]
+    await ctx.send(random.choice(dances) + " Time to dance!")
+
+
