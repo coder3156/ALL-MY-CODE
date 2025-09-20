@@ -1,0 +1,374 @@
+# bot.py
+# Requires: python 3.10+, discord.py 2.3+
+# Features:
+# - Departments: link multiple guilds by name
+# - Cross-department punishments: warn, kick, mute(timeout), ban
+# - Case IDs with SQLite logging
+# - Slash commands + basic permission gating
+# - Optional automatic ban sync via on_member_ban
+
+import asyncio
+import json
+import logging
+import sqlite3
+from datetime import timedelta
+
+import discord
+from discord import app_commands
+from discord.ext import commands
+
+# ---------- Logging ----------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s"
+)
+log = logging.getLogger("deptmod")
+
+# ---------- Load config ----------
+with open("config.json", "r", encoding="utf-8") as f:
+    CONFIG = json.load(f)
+
+TOKEN: str = CONFIG["token"]
+PREFIX: str = CONFIG.get("prefix", "!")
+OWNERS: list[int] = CONFIG.get("owners", [])
+
+# ---------- Intents / Bot ----------
+intents = discord.Intents.default()
+# moderation needs these:
+intents.message_content = False
+intents.members = True
+intents.guilds = True
+intents.bans = True
+
+bot = commands.Bot(command_prefix=PREFIX, intents=intents)
+tree = bot.tree  # type: app_commands.CommandTree
+
+# ---------- Database ----------
+DB_PATH = CONFIG.get("database", "departments.db")
+conn = sqlite3.connect(DB_PATH)
+conn.row_factory = sqlite3.Row
+c = conn.cursor()
+
+c.execute("""
+CREATE TABLE IF NOT EXISTS departments (
+    name TEXT NOT NULL,
+    guild_id INTEGER NOT NULL,
+    UNIQUE(name, guild_id)
+)
+""")
+
+c.execute("""
+CREATE TABLE IF NOT EXISTS punishments (
+    case_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    punishment_type TEXT NOT NULL,         -- warn | kick | mute | ban
+    reason TEXT,
+    staff_id INTEGER NOT NULL,
+    guild_id INTEGER NOT NULL,             -- guild where this record applies
+    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+)
+""")
+conn.commit()
+
+# ---------- Helpers ----------
+def get_department_name_for_guild(guild_id: int) -> str | None:
+    c.execute("SELECT name FROM departments WHERE guild_id = ?", (guild_id,))
+    row = c.fetchone()
+    return row["name"] if row else None
+
+def get_guilds_in_department(dept_name: str) -> list[int]:
+    c.execute("SELECT guild_id FROM departments WHERE name = ?", (dept_name,))
+    return [row["guild_id"] for row in c.fetchall()]
+
+def get_linked_guilds_for(guild_id: int) -> list[int]:
+    """Return all guild IDs linked to the same department as guild_id.
+       Includes the current guild_id in the list (if present)."""
+    dept = get_department_name_for_guild(guild_id)
+    if not dept:
+        return []
+    return get_guilds_in_department(dept)
+
+def insert_punishment(user_id: int, ptype: str, reason: str, staff_id: int, guild_id: int) -> int:
+    c.execute(
+        "INSERT INTO punishments (user_id, punishment_type, reason, staff_id, guild_id) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (user_id, ptype, reason, staff_id, guild_id),
+    )
+    conn.commit()
+    return c.lastrowid
+
+async def ensure_app_commands(guild: discord.Guild | None = None):
+    # Sync slash commands either globally or per guild (faster dev if you add guild=...)
+    try:
+        if guild:
+            await tree.sync(guild=guild)
+            log.info(f"Synced commands to guild {guild.id} ({guild.name})")
+        else:
+            await tree.sync()
+            log.info("Synced global commands")
+    except Exception as e:
+        log.exception("Failed to sync commands: %s", e)
+
+# ---------- Events ----------
+@bot.event
+async def on_ready():
+    log.info("Logged in as %s (%s)", bot.user, bot.user.id if bot.user else "?")
+    # Global sync; comment this out and use per-guild sync during development if needed
+    await ensure_app_commands()
+
+@bot.event
+async def on_guild_join(guild: discord.Guild):
+    # Optional: sync commands quicker for the new guild
+    await ensure_app_commands(guild)
+
+# OPTIONAL: Automatically propagate bans done outside the bot’s /syncban command.
+@bot.event
+async def on_member_ban(guild: discord.Guild, user: discord.User | discord.Member):
+    try:
+        linked = get_linked_guilds_for(guild.id)
+        if not linked:
+            return
+        for g_id in linked:
+            if g_id == guild.id:
+                continue
+            g = bot.get_guild(g_id)
+            if not g:
+                continue
+            try:
+                await g.ban(user, reason=f"Synced ban from {guild.name}")
+                insert_punishment(user.id, "ban", f"Synced ban from {guild.id}", bot.user.id if bot.user else 0, g.id)
+            except discord.Forbidden:
+                log.warning("Missing ban perms in %s", g.name)
+            except discord.HTTPException as e:
+                log.warning("Failed to ban in %s: %s", g.name, e)
+    except Exception:
+        log.exception("Error during on_member_ban sync")
+
+# ---------- Permission checks for slash commands ----------
+def default_admin_perms():
+    # You can adjust per command below
+    return discord.Permissions(
+        administrator=False,
+        ban_members=True,
+        kick_members=True,
+        moderate_members=True,
+        manage_messages=True
+    )
+
+# ---------- Slash Commands: Department Management ----------
+@tree.command(name="adddepartment", description="Add this server to a department (use the same name in each linked server).")
+@app_commands.describe(name="Department name to join/create")
+@app_commands.default_member_permissions(administrator=True)
+async def adddepartment(interaction: discord.Interaction, name: str):
+    try:
+        c.execute("INSERT OR IGNORE INTO departments (name, guild_id) VALUES (?, ?)", (name, interaction.guild_id))
+        conn.commit()
+        await interaction.response.send_message(f"✅ Added **{interaction.guild.name}** to department **{name}**.", ephemeral=True)
+    except Exception as e:
+        log.exception("adddepartment error: %s", e)
+        await interaction.response.send_message("❌ Failed to add department.", ephemeral=True)
+
+@tree.command(name="removedepartment", description="Remove this server from its department.")
+@app_commands.default_member_permissions(administrator=True)
+async def removedepartment(interaction: discord.Interaction):
+    try:
+        c.execute("DELETE FROM departments WHERE guild_id = ?", (interaction.guild_id,))
+        conn.commit()
+        await interaction.response.send_message("🗑️ Removed this server from its department.", ephemeral=True)
+    except Exception as e:
+        log.exception("removedepartment error: %s", e)
+        await interaction.response.send_message("❌ Failed to remove department.", ephemeral=True)
+
+@tree.command(name="department_info", description="Show the department name and linked servers for this server.")
+async def department_info(interaction: discord.Interaction):
+    dept = get_department_name_for_guild(interaction.guild_id)
+    if not dept:
+        await interaction.response.send_message("ℹ️ This server is not in any department.", ephemeral=True)
+        return
+    linked = get_guilds_in_department(dept)
+    names = []
+    for gid in linked:
+        g = bot.get_guild(gid)
+        names.append(f"{g.name} (`{gid}`)" if g else f"`{gid}`")
+    msg = f"**Department:** {dept}\n**Linked Servers ({len(linked)}):**\n" + "\n".join(names)
+    await interaction.response.send_message(msg, ephemeral=True)
+
+# ---------- Slash Commands: Punishments ----------
+# WARN
+@tree.command(name="warn", description="Warn a user across this department.")
+@app_commands.describe(user="User to warn", reason="Reason for the warning")
+@app_commands.default_member_permissions(manage_messages=True)
+async def warn(interaction: discord.Interaction, user: discord.User, reason: str = "No reason provided"):
+    await interaction.response.defer(ephemeral=True)
+    linked = get_linked_guilds_for(interaction.guild_id)
+    if not linked:
+        await interaction.followup.send("This server is not in a department. Use /adddepartment first.", ephemeral=True)
+        return
+
+    case_ids = []
+    for gid in linked:
+        case_id = insert_punishment(user.id, "warn", reason, interaction.user.id, gid)
+        case_ids.append(case_id)
+
+    await interaction.followup.send(f"⚠️ Warned **{user}** across **{len(linked)}** servers.\nCases: {', '.join(map(str, case_ids))}", ephemeral=True)
+
+# KICK
+@tree.command(name="synckick", description="Kick a user across this department.")
+@app_commands.describe(user="User to kick", reason="Reason for the kick")
+@app_commands.default_member_permissions(kick_members=True)
+async def synckick(interaction: discord.Interaction, user: discord.User, reason: str = "No reason provided"):
+    await interaction.response.defer(ephemeral=True)
+    linked = get_linked_guilds_for(interaction.guild_id)
+    if not linked:
+        await interaction.followup.send("This server is not in a department. Use /adddepartment first.", ephemeral=True)
+        return
+
+    case_ids = []
+    for gid in linked:
+        g = bot.get_guild(gid)
+        if not g:
+            continue
+        member = g.get_member(user.id)
+        if not member:
+            # not present in that guild -> skip kick but still log if desired
+            continue
+        try:
+            await member.kick(reason=f"[Dept Sync] {reason}")
+            case_ids.append(insert_punishment(user.id, "kick", reason, interaction.user.id, gid))
+        except discord.Forbidden:
+            log.warning("Missing kick permission in %s", g.name)
+        except discord.HTTPException as e:
+            log.warning("Kick failed in %s: %s", g.name, e)
+
+    await interaction.followup.send(f"👢 Attempted kicks for **{user}** across **{len(linked)}** servers.\nCases: {', '.join(map(str, case_ids)) or '—'}", ephemeral=True)
+
+# MUTE (Timeout)
+@tree.command(name="syncmute", description="Timeout a user across this department.")
+@app_commands.describe(user="User to mute", minutes="Timeout length in minutes", reason="Reason for the mute")
+@app_commands.default_member_permissions(moderate_members=True)
+async def syncmute(interaction: discord.Interaction, user: discord.User, minutes: app_commands.Range[int, 1, 10080], reason: str = "No reason provided"):
+    await interaction.response.defer(ephemeral=True)
+    linked = get_linked_guilds_for(interaction.guild_id)
+    if not linked:
+        await interaction.followup.send("This server is not in a department. Use /adddepartment first.", ephemeral=True)
+        return
+
+    duration = timedelta(minutes=int(minutes))
+    case_ids = []
+    for gid in linked:
+        g = bot.get_guild(gid)
+        if not g:
+            continue
+        member = g.get_member(user.id)
+        if not member:
+            continue
+        try:
+            await member.timeout(duration, reason=f"[Dept Sync] {reason}")  # discord.py 2.3: member.timeout()
+            case_ids.append(insert_punishment(user.id, "mute", reason, interaction.user.id, gid))
+        except discord.Forbidden:
+            log.warning("Missing moderate members permission in %s", g.name)
+        except discord.HTTPException as e:
+            log.warning("Timeout failed in %s: %s", g.name, e)
+
+    await interaction.followup.send(
+        f"🔇 Timed out **{user}** for **{minutes}m** across **{len(linked)}** servers.\nCases: {', '.join(map(str, case_ids)) or '—'}",
+        ephemeral=True
+    )
+
+# BAN
+@tree.command(name="syncban", description="Ban a user across this department.")
+@app_commands.describe(user="User to ban", reason="Reason for the ban")
+@app_commands.default_member_permissions(ban_members=True)
+async def syncban(interaction: discord.Interaction, user: discord.User, reason: str = "No reason provided"):
+    await interaction.response.defer(ephemeral=True)
+    linked = get_linked_guilds_for(interaction.guild_id)
+    if not linked:
+        await interaction.followup.send("This server is not in a department. Use /adddepartment first.", ephemeral=True)
+        return
+
+    case_ids = []
+    for gid in linked:
+        g = bot.get_guild(gid)
+        if not g:
+            continue
+        try:
+            await g.ban(user, reason=f"[Dept Sync] {reason}", delete_message_days=0)
+            case_ids.append(insert_punishment(user.id, "ban", reason, interaction.user.id, gid))
+        except discord.Forbidden:
+            log.warning("Missing ban permission in %s", g.name)
+        except discord.HTTPException as e:
+            log.warning("Ban failed in %s: %s", g.name, e)
+
+    await interaction.followup.send(f"⛔ Banned **{user}** across **{len(linked)}** servers.\nCases: {', '.join(map(str, case_ids)) or '—'}", ephemeral=True)
+
+# ---------- History / Case Lookup ----------
+@tree.command(name="punishments", description="See all punishments for a user (across every department, if recorded).")
+@app_commands.describe(user="User to view")
+@app_commands.default_member_permissions(manage_messages=True)
+async def punishments(interaction: discord.Interaction, user: discord.User):
+    await interaction.response.defer(ephemeral=True)
+    c.execute(
+        "SELECT case_id, punishment_type, reason, staff_id, guild_id, timestamp "
+        "FROM punishments WHERE user_id = ? ORDER BY case_id DESC LIMIT 20",
+        (user.id,)
+    )
+    rows = c.fetchall()
+
+    if not rows:
+        await interaction.followup.send(f"No punishments found for **{user}**.", ephemeral=True)
+        return
+
+    embed = discord.Embed(
+        title=f"Punishment History — {user}",
+        color=discord.Color.red()
+    )
+    for row in rows:
+        case_id = row["case_id"]
+        ptype = row["punishment_type"].upper()
+        reason = row["reason"] or "No reason"
+        staff = bot.get_user(row["staff_id"])
+        staff_name = staff.mention if staff else f"`{row['staff_id']}`"
+        g = bot.get_guild(row["guild_id"])
+        gname = g.name if g else f"`{row['guild_id']}`"
+        embed.add_field(
+            name=f"Case #{case_id} • {ptype} • {gname}",
+            value=f"**Reason:** {reason}\n**Staff:** {staff_name}\n**Time:** {row['timestamp']}",
+            inline=False
+        )
+
+    embed.set_footer(text="Showing latest 20 cases.")
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+@tree.command(name="case", description="Look up a single punishment by Case ID.")
+@app_commands.describe(case_id="The case ID number")
+@app_commands.default_member_permissions(manage_messages=True)
+async def case(interaction: discord.Interaction, case_id: int):
+    await interaction.response.defer(ephemeral=True)
+    c.execute(
+        "SELECT user_id, punishment_type, reason, staff_id, guild_id, timestamp "
+        "FROM punishments WHERE case_id = ?",
+        (case_id,)
+    )
+    row = c.fetchone()
+    if not row:
+        await interaction.followup.send(f"No punishment found with Case ID `{case_id}`.", ephemeral=True)
+        return
+
+    user = bot.get_user(row["user_id"])
+    staff = bot.get_user(row["staff_id"])
+    g = bot.get_guild(row["guild_id"])
+    embed = discord.Embed(title=f"Case #{case_id}", color=discord.Color.blurple())
+    embed.add_field(name="User", value=f"{user} (`{row['user_id']}`)", inline=False)
+    embed.add_field(name="Type", value=row["punishment_type"].upper(), inline=True)
+    embed.add_field(name="Reason", value=row["reason"] or "No reason", inline=False)
+    embed.add_field(name="Staff", value=f"{staff} (`{row['staff_id']}`)", inline=False)
+    embed.add_field(name="Server", value=g.name if g else f"`{row['guild_id']}`", inline=True)
+    embed.add_field(name="Time", value=row["timestamp"], inline=False)
+
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+# ---------- Run ----------
+if __name__ == "__main__":
+    bot.run(TOKEN)
+
+
