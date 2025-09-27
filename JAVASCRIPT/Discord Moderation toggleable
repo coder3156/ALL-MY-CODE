@@ -1,0 +1,114 @@
+const { Client, GatewayIntentBits, Collection, SlashCommandBuilder, REST, Routes } = require("discord.js");
+const fs = require("fs");
+
+const TOKEN = "YOUR_BOT_TOKEN";
+const CLIENT_ID = "YOUR_CLIENT_ID";
+const GUILD_ID = "YOUR_GUILD_ID";
+
+const client = new Client({
+  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers],
+});
+
+// Store cases + moderation toggle
+let cases = [];
+let moderationEnabled = true;
+
+// Load cases from file (if exists)
+if (fs.existsSync("cases.json")) {
+  cases = JSON.parse(fs.readFileSync("cases.json"));
+}
+
+// Save cases
+function saveCases() {
+  fs.writeFileSync("cases.json", JSON.stringify(cases, null, 2));
+}
+
+// Generate unique case ID
+function generateCaseID() {
+  return `CASE-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
+}
+
+// Slash commands
+const commands = [
+  new SlashCommandBuilder()
+    .setName("togglemoderation")
+    .setDescription("Enable or disable moderation system")
+    .addBooleanOption(option =>
+      option.setName("enabled").setDescription("Enable? true/false").setRequired(true)
+    ),
+
+  new SlashCommandBuilder()
+    .setName("warn")
+    .setDescription("Warn a user")
+    .addUserOption(option => option.setName("target").setDescription("User to warn").setRequired(true))
+    .addStringOption(option => option.setName("reason").setDescription("Reason for warning")),
+
+  new SlashCommandBuilder()
+    .setName("case")
+    .setDescription("Look up a case by ID")
+    .addStringOption(option => option.setName("id").setDescription("Case ID").setRequired(true)),
+].map(command => command.toJSON());
+
+// Register commands
+const rest = new REST({ version: "10" }).setToken(TOKEN);
+
+(async () => {
+  try {
+    await rest.put(Routes.applicationGuildCommands(CLIENT_ID, GUILD_ID), { body: commands });
+    console.log("✅ Slash commands registered");
+  } catch (error) {
+    console.error(error);
+  }
+})();
+
+client.on("ready", () => {
+  console.log(`Logged in as ${client.user.tag}`);
+});
+
+client.on("interactionCreate", async interaction => {
+  if (!interaction.isChatInputCommand()) return;
+
+  const { commandName } = interaction;
+
+  if (commandName === "togglemoderation") {
+    moderationEnabled = interaction.options.getBoolean("enabled");
+    await interaction.reply(`⚙️ Moderation system is now **${moderationEnabled ? "ENABLED" : "DISABLED"}**`);
+  }
+
+  if (commandName === "warn") {
+    if (!moderationEnabled) return interaction.reply("🚫 Moderation is currently disabled.");
+
+    const user = interaction.options.getUser("target");
+    const reason = interaction.options.getString("reason") || "No reason provided";
+
+    const caseID = generateCaseID();
+    const caseData = {
+      caseID,
+      action: "warn",
+      user: `${user.tag} (${user.id})`,
+      reason,
+      moderator: `${interaction.user.tag} (${interaction.user.id})`,
+      timestamp: new Date().toISOString(),
+    };
+
+    cases.push(caseData);
+    saveCases();
+
+    await interaction.reply(`⚠️ ${user.tag} has been warned. Case ID: **${caseID}**`);
+  }
+
+  if (commandName === "case") {
+    const caseID = interaction.options.getString("id");
+    const foundCase = cases.find(c => c.caseID === caseID);
+
+    if (!foundCase) return interaction.reply("❌ Case not found.");
+
+    await interaction.reply(
+      `📂 **Case ID:** ${foundCase.caseID}\n**Action:** ${foundCase.action}\n**User:** ${foundCase.user}\n**Reason:** ${foundCase.reason}\n**Moderator:** ${foundCase.moderator}\n**Timestamp:** ${foundCase.timestamp}`
+    );
+  }
+});
+
+client.login(TOKEN);
+
+
