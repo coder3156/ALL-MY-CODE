@@ -1,0 +1,90 @@
+import discord
+from discord.ext import commands
+from discord import app_commands
+import json
+import random
+import time
+import os
+
+TOKEN = "YOUR_BOT_TOKEN"
+GUILD_ID = YOUR_GUILD_ID   # Replace with your guild/server ID (int)
+
+intents = discord.Intents.default()
+intents.guilds = True
+intents.members = True
+
+bot = commands.Bot(command_prefix="!", intents=intents)
+tree = bot.tree
+
+# Storage
+cases = []
+moderation_enabled = True
+
+# Load cases if file exists
+if os.path.exists("cases.json"):
+    with open("cases.json", "r") as f:
+        cases = json.load(f)
+
+def save_cases():
+    with open("cases.json", "w") as f:
+        json.dump(cases, f, indent=2)
+
+def generate_case_id():
+    return f"CASE-{int(time.time())}-{random.randint(100, 999)}"
+
+@bot.event
+async def on_ready():
+    await tree.sync(guild=discord.Object(id=GUILD_ID))
+    print(f"✅ Logged in as {bot.user} and synced slash commands")
+
+# Toggle moderation
+@tree.command(name="togglemoderation", description="Enable or disable moderation system", guild=discord.Object(id=GUILD_ID))
+@app_commands.describe(enabled="Enable? true/false")
+async def togglemoderation(interaction: discord.Interaction, enabled: bool):
+    global moderation_enabled
+    moderation_enabled = enabled
+    await interaction.response.send_message(f"⚙️ Moderation system is now **{'ENABLED' if enabled else 'DISABLED'}**")
+
+# Warn command
+@tree.command(name="warn", description="Warn a user", guild=discord.Object(id=GUILD_ID))
+@app_commands.describe(target="User to warn", reason="Reason for warning")
+async def warn(interaction: discord.Interaction, target: discord.User, reason: str = "No reason provided"):
+    global moderation_enabled
+    if not moderation_enabled:
+        return await interaction.response.send_message("🚫 Moderation is currently disabled.")
+
+    case_id = generate_case_id()
+    case_data = {
+        "caseID": case_id,
+        "action": "warn",
+        "user": f"{target} ({target.id})",
+        "reason": reason,
+        "moderator": f"{interaction.user} ({interaction.user.id})",
+        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())
+    }
+
+    cases.append(case_data)
+    save_cases()
+
+    await interaction.response.send_message(f"⚠️ {target.mention} has been warned.\nCase ID: **{case_id}**")
+
+# Case lookup
+@tree.command(name="case", description="Look up a case by ID", guild=discord.Object(id=GUILD_ID))
+@app_commands.describe(id="Case ID")
+async def case(interaction: discord.Interaction, id: str):
+    found_case = next((c for c in cases if c["caseID"] == id), None)
+    if not found_case:
+        return await interaction.response.send_message("❌ Case not found.")
+
+    embed = discord.Embed(title=f"📂 Case {found_case['caseID']}", color=discord.Color.blue())
+    embed.add_field(name="Action", value=found_case["action"], inline=False)
+    embed.add_field(name="User", value=found_case["user"], inline=False)
+    embed.add_field(name="Reason", value=found_case["reason"], inline=False)
+    embed.add_field(name="Moderator", value=found_case["moderator"], inline=False)
+    embed.add_field(name="Timestamp", value=found_case["timestamp"], inline=False)
+
+    await interaction.response.send_message(embed=embed)
+
+bot.run(TOKEN)
+
+
